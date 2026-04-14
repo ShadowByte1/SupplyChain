@@ -34,7 +34,7 @@ Built for HackerOne bug bounty research. Produces exploitation-ready reports wit
 ## Installation
  
 ```bash
-git clone https://github.com/ShadowByte1/chain-audit
+git clone https://github.com/ShadowByte1/SupplyChain
 cd chain-audit
 pip install requests dnspython
 ```
