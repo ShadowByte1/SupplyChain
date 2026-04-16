@@ -44,7 +44,7 @@ Usage:
   python3 supplychain.py --js bundle.js
   python3 supplychain.py --package-json package.json
   python3 supplychain.py --workflow .github/workflows/deploy.yml
-  python3 supplychain.py --github-org enphaseenergy
+  python3 supplychain.py --github-org gitorg
   python3 supplychain.py -u https://target.com/ -o results.json
   python3 supplychain.py -u https://target.com/ --show-floating  # include non-takeable risks
 
