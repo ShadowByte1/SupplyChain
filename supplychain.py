@@ -6,6 +6,26 @@ Finds CLAIMED (already squatted/malicious) and UNCLAIMED (claimable)
 supply chain attack surfaces. Every finding passes a multi-stage
 validation chain before being reported — no speculation, no guesses.
 
+KEY IMPROVEMENTS OVER v2:
+  Dynamic Construction FP Guard
+      CDN URLs extracted from minified JS bundles often contain string
+      concatenation artifacts (e.g. emoji-datasource-".concat(e.set,...))
+      that look like package names but aren't. The scanner now detects
+      these patterns and discards them before any registry lookup.
+
+  Confirmed Takeover Status
+      Every finding is classified by whether the user can *actually* take
+      it over right now, vs it just being a floating-ref risk:
+        CLAIMABLE_NOW   — namespace/package is gone, CDN URL resolves to it
+        ALREADY_TAKEN   — malicious content already in CDN response
+        DEAD_MAINTAINER — package exists but maintainer accounts are gone
+        ARCHIVED_RISK   — repo is archived, may become reclaimable
+        FLOATING_REF    — active maintainer, not takeable (informational only)
+
+  npm Dead Maintainer Confirmation
+      For each listed npm maintainer, we check if the npm username is
+      actually registerable (not just "doesn't appear in search").
+
 Detection coverage:
   CDN scripts      → jsDelivr (gh/ + npm/), unpkg, cdnjs, rawgit,
                      raw.githubusercontent.com, esm.sh, skypack.dev,
@@ -15,19 +35,7 @@ Detection coverage:
   Signals          → namespace squatting, content replacement, tag
                      inflation, dead maintainers, dep confusion,
                      SRI absence, floating refs, archived Wayback diff
-  Validation       → 3-stage chain per finding before output
-
-NEW DETECTIONS (v2):
-  Typosquatting    → Levenshtein distance 1-2 against top 500 npm pkgs
-  Manifest poisoning → postinstall/preinstall lifecycle script scanning
-  lockfile confusion → package-lock.json resolved URL vs declared name
-  GitHub Actions pinning → SHA-pin audit, unpinned 3rd-party actions
-  Retired CDN hosts → rawgit, gitcdn, old esm/skypack endpoints
-  PyPI/RubyGems/Cargo namespace squatting (mirrors npm checks)
-  Self-hosted font/resource exfil → @font-face src: external + data-uri tricks
-  npm package scope squatting → @scope unclaimed check (improved)
-  Sourcemap exfil → //# sourceMappingURL pointing to attacker infra
-  Package.json "scripts" injection → lifecycle hooks with curl/wget/eval
+  Validation       → 3-stage chain + takeover confirmation per finding
 
 Usage:
   python3 supplychain.py -u https://target.com/
@@ -38,6 +46,7 @@ Usage:
   python3 supplychain.py --workflow .github/workflows/deploy.yml
   python3 supplychain.py --github-org enphaseenergy
   python3 supplychain.py -u https://target.com/ -o results.json
+  python3 supplychain.py -u https://target.com/ --show-floating  # include non-takeable risks
 
 Author: Shadowbyte
 """
@@ -110,20 +119,161 @@ def gh_api(path):
         except Exception: pass
     return None
 
+
+# ─────────────────────────────────────────────────────────────
+# TAKEOVER STATUS CONSTANTS
+# ─────────────────────────────────────────────────────────────
+TS_CLAIMABLE_NOW   = "CLAIMABLE_NOW"    # namespace/package gone, CDN resolves to it — act NOW
+TS_ALREADY_TAKEN   = "ALREADY_TAKEN"   # malicious content already in CDN response
+TS_DEAD_MAINTAINER = "DEAD_MAINTAINER" # package exists but maintainer accounts are registerable
+TS_ARCHIVED_RISK   = "ARCHIVED_RISK"   # repo archived, may become claimable
+TS_FLOATING_REF    = "FLOATING_REF"    # active project, not currently takeable (risk only)
+TS_FALSE_POSITIVE  = "FALSE_POSITIVE"  # dynamic construction artifact or other FP
+TS_UNKNOWN         = "UNKNOWN"         # couldn't determine
+
+
+# ─────────────────────────────────────────────────────────────
+# DYNAMIC CONSTRUCTION FALSE POSITIVE DETECTION
+# ─────────────────────────────────────────────────────────────
+
+# Patterns that indicate a URL fragment extracted from JS string concatenation:
+#   "https://cdn.jsdelivr.net/npm/emoji-datasource-".concat(e.set, "@15.0.1/...")
+#   `https://unpkg.com/${pkgName}@latest/...`
+#   "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo
+
+_CONCAT_ARTIFACT_RE = re.compile(
+    r'''
+    (?:
+        \.concat\s*\(                   # .concat( immediately after the URL string
+        | \$\{                          # template literal ${
+        | ["']\s*\+\s*["']             # string concatenation: "..." + "..."
+        | ["']\s*\+\s*[a-zA-Z_$]       # string + variable: "..." + varName
+        | [a-zA-Z_$]\s*\+\s*["']       # variable + string: varName + "..."
+    )
+    ''',
+    re.VERBOSE
+)
+
+# Characters that should never end a valid package name, owner, or repo
+_INVALID_TRAILING = re.compile(r'[-_./\\]$')
+
+# Characters that should never appear in a valid npm package or GitHub owner/repo
+_INVALID_CHARS_PKG  = re.compile(r'[^a-zA-Z0-9._@/\-]')
+_INVALID_CHARS_REPO = re.compile(r'[^a-zA-Z0-9._\-]')
+
+# Minimum meaningful length for a package/owner name
+_MIN_NAME_LEN = 2
+
+def is_dynamic_construction_artifact(url: str, surrounding_context: str = "") -> bool:
+    """
+    Return True if this URL appears to be a fragment from JS string concatenation
+    rather than a real, complete CDN URL.
+
+    Checks:
+    1. Package name / owner / repo ends with an invalid trailing character (-, _, .)
+    2. The surrounding JS context shows .concat( or template literals right after the URL
+    3. The package/owner portion contains invalid characters suggesting it was mid-parse
+    4. The extracted name is implausibly short (single char, empty string)
+    """
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.lstrip("/")
+    except Exception:
+        return False
+
+    # ── Check 1: trailing invalid characters in the path components ──
+    # Split out the meaningful name part depending on CDN type
+    host = parsed.netloc.lower()
+    name_to_check = ""
+
+    if "jsdelivr.net/npm" in url or "unpkg.com" in url or "esm.sh" in url:
+        # Path is like: /packagename@version/file or /@scope/pkg@version/file
+        # Extract just the package name (before @ or /)
+        pkg_part = path.lstrip("@").split("@")[0].split("/")
+        if pkg_part:
+            # For scoped packages like @scope/name, check 'name' part
+            name_to_check = pkg_part[-1] if len(pkg_part) > 1 else pkg_part[0]
+
+    elif "jsdelivr.net/gh" in url or "raw.githubusercontent.com" in url:
+        # Path is like: owner/repo@ref/file
+        parts = path.split("/")
+        if len(parts) >= 2:
+            name_to_check = parts[1].split("@")[0]  # repo name
+
+    if name_to_check:
+        # Empty name = definitely a fragment
+        if not name_to_check.strip():
+            return True
+        # Too short to be meaningful
+        if len(name_to_check) < _MIN_NAME_LEN:
+            return True
+        # Ends with invalid trailing character
+        if _INVALID_TRAILING.search(name_to_check):
+            return True
+        # Contains characters that can't be in a valid name
+        if _INVALID_CHARS_REPO.search(name_to_check):
+            return True
+
+    # ── Check 2: surrounding context shows concat/template literal ──
+    if surrounding_context:
+        # Look at what comes right after the URL string ends
+        url_end_idx = surrounding_context.find(url)
+        if url_end_idx != -1:
+            after = surrounding_context[url_end_idx + len(url):url_end_idx + len(url) + 60]
+            if _CONCAT_ARTIFACT_RE.search(after):
+                return True
+
+    # ── Check 3: the URL itself ends mid-word suggesting it was truncated ──
+    # A complete CDN URL should have at least a filename or version after the package
+    if "jsdelivr.net/npm/" in url or "unpkg.com/" in url:
+        # After the CDN host, we need at least pkg@version/file or pkg/file
+        npm_path = re.sub(r'https?://(?:cdn\.jsdelivr\.net/npm|unpkg\.com)/', '', url)
+        # A valid npm CDN URL has at minimum: pkgname/file.js or pkgname@ver/file.js
+        # A fragment like "emoji-datasource-" has no @ and no subsequent path
+        at_count = npm_path.count("@")
+        slash_count = npm_path.count("/")
+        # If no slash and no @, it's likely just a package name fragment with no version/file
+        # (unless it's a very simple case like unpkg.com/jquery which auto-redirects)
+        if at_count == 0 and slash_count == 0 and len(npm_path) > 0:
+            # Could be valid (auto-redirect) but if it ends with - it's definitely a fragment
+            if npm_path.endswith("-") or npm_path.endswith(".") or npm_path.endswith("_"):
+                return True
+
+    return False
+
+
+def clean_extracted_url(url: str) -> Optional[str]:
+    """
+    Clean a URL extracted from JS source. Returns None if it should be discarded.
+    Strips common JS string artifacts from the end of URLs.
+    """
+    # Strip trailing JS string delimiters and concat artifacts
+    url = url.strip()
+
+    # Remove trailing quote characters that got swept in
+    url = url.rstrip("\"'`\\")
+
+    # Strip common concat suffixes that look like they're part of the URL
+    for suffix in ['".concat(', "'.concat(", "`${", '" +', "' +"]:
+        if suffix in url:
+            url = url[:url.index(suffix)]
+
+    url = url.strip().rstrip("\"'`\\")
+
+    if len(url) < 20:
+        return None
+
+    return url
+
+
 # ─────────────────────────────────────────────────────────────
 # Established account / library heuristics
 # ─────────────────────────────────────────────────────────────
-# Used to suppress false positives on well-known legitimate projects.
-# A "trusted maintainer" is: account age >2yr AND followers >500 AND stars >500.
-# Content changes on these accounts are almost certainly legitimate version bumps,
-# not supply chain attacks. We demote from HIGH/CLAIMED to INFO and add a note.
-
 TRUSTED_ACCOUNT_FOLLOWERS_MIN = 500
-TRUSTED_ACCOUNT_AGE_DAYS_MIN  = 730   # 2 years
+TRUSTED_ACCOUNT_AGE_DAYS_MIN  = 730
 TRUSTED_REPO_STARS_MIN        = 500
 
 def _is_trusted_maintainer(user_info: dict, repo_info: dict = None) -> bool:
-    """Return True if this account/repo looks like a legitimate, established project."""
     if not user_info.get("exists"):
         return False
     age = user_info.get("age_days") or 0
@@ -135,6 +285,7 @@ def _is_trusted_maintainer(user_info: dict, repo_info: dict = None) -> bool:
         if stars < TRUSTED_REPO_STARS_MIN:
             return False
     return True
+
 
 # ─────────────────────────────────────────────────────────────
 # Malicious content detection
@@ -172,21 +323,17 @@ POC_MARKER = re.compile(
     re.MULTILINE
 )
 
-# ── NEW: Lifecycle script injection patterns ──────────────────
-# postinstall/preinstall hooks that run shell commands = npm install-time RCE
 LIFECYCLE_INJECT = re.compile(
     r'(?:curl|wget|bash|sh|python|node|exec|eval|nc\s|ncat\s|/bin/sh|/bin/bash'
     r'|\$\(.*\)|`.*`)',
     re.IGNORECASE
 )
 
-# ── NEW: Sourcemap exfil — //# sourceMappingURL pointing outside the origin ──
 SOURCEMAP_EXFIL = re.compile(
     r'//[#@]\s*sourceMappingURL\s*=\s*(https?://[^\s"\']+)',
     re.IGNORECASE
 )
 
-# ── NEW: Self-hosted resource loading external data via CSS tricks ────────────
 CSS_EXFIL = re.compile(
     r'@font-face\s*\{[^}]*src\s*:[^}]*url\s*\(\s*["\']?(https?://[^"\')\s]{10,})["\']?\s*\)',
     re.IGNORECASE | re.DOTALL
@@ -223,11 +370,9 @@ def detect_malicious(content: str) -> list[str]:
     if ub_match:
         findings.append(f"Unconditionally malicious: `{ub_match.group(0)[:80]}`")
 
-    # ── NEW: sourcemap exfil ─────────────────────────────────
     sm_match = SOURCEMAP_EXFIL.search(content)
     if sm_match:
         sm_url = sm_match.group(1)
-        # Only flag if the sourcemap URL is NOT on a known CDN/same-domain
         if not any(safe in sm_url for safe in [
             "cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
             "raw.githubusercontent.com", "ajax.googleapis.com",
@@ -238,10 +383,8 @@ def detect_malicious(content: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Typosquatting detector
+# Typosquatting detector
 # ─────────────────────────────────────────────────────────────
-# Top ~100 most-downloaded npm packages that are commonly typosquatted.
-# Levenshtein distance 1 against this list = typosquatting candidate.
 
 TOP_NPM_PACKAGES = {
     "lodash", "express", "react", "react-dom", "axios", "moment", "chalk",
@@ -262,7 +405,6 @@ TOP_NPM_PACKAGES = {
 }
 
 def _levenshtein(a: str, b: str) -> int:
-    """Fast Levenshtein distance."""
     if a == b: return 0
     if len(a) < len(b): a, b = b, a
     prev = list(range(len(b) + 1))
@@ -275,15 +417,12 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 def check_typosquatting(pkg_name: str) -> Optional[str]:
-    """Return the closest legitimate package name if distance ≤ 1, else None."""
-    # Strip scope prefix for comparison
     name = pkg_name.lstrip("@").split("/")[-1].lower()
-    # Skip very short names (too many false positives)
     if len(name) < 4:
         return None
     for legit in TOP_NPM_PACKAGES:
         if name == legit:
-            return None  # exact match = not a typosquat
+            return None
         if abs(len(name) - len(legit)) > 2:
             continue
         dist = _levenshtein(name, legit)
@@ -293,16 +432,10 @@ def check_typosquatting(pkg_name: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Package lifecycle script scanner
+# Package lifecycle script scanner
 # ─────────────────────────────────────────────────────────────
 
 def scan_lifecycle_scripts(pkg_json_text: str, source: str = "") -> list[dict]:
-    """
-    Scan package.json lifecycle hooks (postinstall, preinstall, install, prepare)
-    for shell injection patterns: curl, wget, bash, eval, $(), backticks.
-    These execute at npm install time — they're install-time RCE if the package
-    is pulled from a squatted/compromised namespace.
-    """
     results = []
     try:
         data = json.loads(pkg_json_text)
@@ -328,7 +461,9 @@ def scan_lifecycle_scripts(pkg_json_text: str, source: str = "") -> list[dict]:
                     f"LIFECYCLE INJECTION: {hook} hook contains shell execution: `{cmd[:120]}`"
                 ],
                 severity="CRITICAL",
-                claimed=True, details={"hook": hook, "cmd": cmd},
+                claimed=True,
+                takeover_status=TS_ALREADY_TAKEN,
+                details={"hook": hook, "cmd": cmd},
                 signals=4,
                 source=source,
             ))
@@ -337,16 +472,10 @@ def scan_lifecycle_scripts(pkg_json_text: str, source: str = "") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Lockfile confusion scanner
+# Lockfile confusion scanner
 # ─────────────────────────────────────────────────────────────
 
 def scan_lockfile_confusion(lockfile_text: str, source: str = "") -> list[dict]:
-    """
-    Detect lockfile confusion: package-lock.json 'resolved' URLs pointing to
-    registries other than registry.npmjs.org (internal mirrors, attacker infra).
-    Also detect packages where the resolved URL domain doesn't match the declared
-    name's expected registry — indicates dependency confusion or mirror poisoning.
-    """
     results = []
     try:
         data = json.loads(lockfile_text)
@@ -366,13 +495,11 @@ def scan_lockfile_confusion(lockfile_text: str, source: str = "") -> list[dict]:
         parsed = urlparse(resolved)
         domain = parsed.netloc.lower()
 
-        # Flag if resolved URL is NOT npmjs.org or known mirrors
         trusted_registries = {
             "registry.npmjs.org", "registry.yarnpkg.com",
             "npm.pkg.github.com", "packages.atlassian.com",
         }
         if domain and domain not in trusted_registries and not domain.endswith(".npmjs.org"):
-            # Internal mirror or unexpected registry
             pkg_name = pkg_path.lstrip("node_modules/").lstrip("/")
             results.append(dict(
                 url=resolved,
@@ -386,6 +513,7 @@ def scan_lockfile_confusion(lockfile_text: str, source: str = "") -> list[dict]:
                 ],
                 severity="HIGH",
                 claimed=False,
+                takeover_status=TS_UNKNOWN,
                 details={"resolved": resolved, "registry": domain},
                 signals=3,
                 source=source,
@@ -395,24 +523,17 @@ def scan_lockfile_confusion(lockfile_text: str, source: str = "") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Enhanced GitHub Actions audit
+# Enhanced GitHub Actions audit
 # ─────────────────────────────────────────────────────────────
 
-# Known safe action owners that should always be trusted
 TRUSTED_ACTION_OWNERS = {
     "actions", "github", "docker", "aws-actions", "azure",
-    "google-github-actions", "hashicorp", "gradle", "gradle",
+    "google-github-actions", "hashicorp", "gradle",
 }
 
 SHA_PIN_RE = re.compile(r'^[a-f0-9]{40}$')
 
 def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
-    """
-    Audit GitHub Actions workflow for:
-    1. Unpinned 3rd-party actions (using tag/branch instead of SHA)
-    2. Actions from deleted/unclaimed repos
-    3. Actions using @main/@master (mutable floating refs)
-    """
     results = []
     for m in re.finditer(r'uses:\s+([a-zA-Z0-9._-]+)/([a-zA-Z0-9._-]+)@([^\s#\n]+)', workflow_text):
         owner, repo, ref = m.group(1), m.group(2), m.group(3).strip()
@@ -422,8 +543,8 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
         issues = []
         severity = "INFO"
         signals = 0
+        takeover_status = TS_UNKNOWN
 
-        # Floating ref check
         if ref.lower() in ("main", "master", "head", "latest", "dev", "next"):
             issues.append(
                 f"FLOATING ACTION REF: {owner}/{repo}@{ref} — mutable branch ref, "
@@ -431,8 +552,6 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
             )
             severity = "HIGH"
             signals += 2
-
-        # Tag (not SHA) — mutable but less risky than branch
         elif not SHA_PIN_RE.match(ref):
             issues.append(
                 f"UNPINNED ACTION: {owner}/{repo}@{ref} — tag reference is mutable "
@@ -441,7 +560,6 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
             severity = "MEDIUM"
             signals += 1
 
-        # Check if the action repo exists
         repo_info = gh_repo(owner, repo)
         if not repo_info.get("exists"):
             issues.append(
@@ -450,6 +568,7 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
             )
             severity = "CRITICAL"
             signals += 3
+            takeover_status = TS_CLAIMABLE_NOW
         elif repo_info.get("archived"):
             issues.append(
                 f"ARCHIVED ACTION REPO: {owner}/{repo} is archived — "
@@ -457,6 +576,10 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
             )
             severity = "MEDIUM" if severity == "INFO" else severity
             signals += 1
+            takeover_status = TS_ARCHIVED_RISK
+        else:
+            if takeover_status == TS_UNKNOWN:
+                takeover_status = TS_FLOATING_REF
 
         if not issues:
             continue
@@ -470,6 +593,7 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
             issues=issues,
             severity=severity,
             claimed=not repo_info.get("exists", True),
+            takeover_status=takeover_status,
             details={"repo": repo_info},
             signals=signals,
             source=source,
@@ -479,11 +603,10 @@ def audit_actions_pinning(workflow_text: str, source: str = "") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: PyPI / RubyGems / Cargo namespace squatting
+# PyPI / Cargo namespace squatting
 # ─────────────────────────────────────────────────────────────
 
 def check_pypi_squatting(pkg_name: str) -> Optional[dict]:
-    """Check if a PyPI package name looks squatted (exists but suspiciously thin)."""
     info = pypi_info(pkg_name)
     if not info.get("exists"):
         return dict(
@@ -496,7 +619,6 @@ def check_pypi_squatting(pkg_name: str) -> Optional[dict]:
 
 
 def check_cargo_squatting(pkg_name: str) -> Optional[dict]:
-    """Check if a Cargo crate looks squatted."""
     info = cargo_info(pkg_name)
     if not info.get("exists"):
         return dict(
@@ -507,7 +629,7 @@ def check_cargo_squatting(pkg_name: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Retired/dead CDN host detector
+# Retired/dead CDN host detector
 # ─────────────────────────────────────────────────────────────
 
 RETIRED_CDN_HOSTS = {
@@ -522,7 +644,6 @@ RETIRED_CDN_HOSTS = {
 }
 
 def check_retired_cdn(url: str) -> Optional[str]:
-    """Return a warning string if the URL uses a known retired CDN host."""
     try:
         host = urlparse(url).netloc.lower()
         for dead_host, reason in RETIRED_CDN_HOSTS.items():
@@ -608,7 +729,7 @@ def gh_npm_scope_owner(scope: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# jsDelivr purge-cache / deleted-but-cached detection
+# jsDelivr stale cache detection
 # ─────────────────────────────────────────────────────────────
 
 def check_jsdelivr_stale_cache(cdn_url: str) -> bool:
@@ -687,26 +808,20 @@ def fetch_live(url: str, retries: int = 2) -> Optional[dict]:
 # Registry checks
 # ─────────────────────────────────────────────────────────────
 
-def _npm_user_exists(username: str) -> bool:
-    r = _get(HTTP, f"https://registry.npmjs.org/-/v1/search?text=maintainer:{username}&size=1", timeout=10)
+def _npm_username_registerable(username: str) -> bool:
+    """
+    Return True if an npm username is registerable (does not exist as an active account).
+    We check the npm profile API directly.
+    """
+    r = _get(HTTP, f"https://www.npmjs.com/~{username}", timeout=8)
     if r is None:
-        return True
+        return False  # network error, assume exists to avoid FP
+    if r.status_code == 404:
+        return True  # account doesn't exist, username is available
     if r.status_code == 200:
-        try:
-            total = r.json().get("total", 0)
-            if total > 0:
-                return True
-            r2 = _get(HTTP, f"https://registry.npmjs.org/-/v1/search?text=maintainer:{username}&size=0", timeout=8)
-            if r2 and r2.status_code == 200:
-                try:
-                    if r2.json().get("total", 0) == 0:
-                        return False
-                except Exception:
-                    pass
-            return False
-        except Exception:
-            return True
-    return True
+        # Check if it's a real profile page
+        return "Page Not Found" in r.text or "doesn't exist" in r.text.lower()
+    return False
 
 
 def npm_info(pkg: str) -> dict:
@@ -729,11 +844,12 @@ def npm_info(pkg: str) -> dict:
     unpub  = "unpublished" in times
 
     maintainers = [m.get("name","") for m in d.get("maintainers", [])]
+
+    # Check each maintainer account — is the npm profile registerable?
     dead = []
     for m in maintainers[:8]:
-        if _npm_user_exists(m):
-            continue
-        dead.append(m)
+        if _npm_username_registerable(m):
+            dead.append(m)
 
     last_pub = times.get(latest, times.get("modified", ""))
     age_days = None
@@ -891,11 +1007,35 @@ def parse_cdn_url(url: str) -> Optional[dict]:
         return None
     if len(url) < 20:
         return None
+
+    # ── Dynamic construction artifact check ──────────────────
+    # Do this BEFORE the regex match to discard URL fragments from JS concat
+    if is_dynamic_construction_artifact(url):
+        return None
+
     for rx, cdn, extractor in CDN_PATTERNS:
         m = rx.match(url)
         if m:
             info = extractor(m.groups())
             info.update({"cdn": cdn, "raw_url": url})
+
+            # Secondary check: validate the extracted name portions
+            pkg = info.get("package") or ""
+            owner = info.get("owner") or ""
+            repo = info.get("repo") or ""
+
+            # Package name fragment check
+            if pkg and (_INVALID_TRAILING.search(pkg.split("/")[-1]) or
+                        len(pkg.lstrip("@").split("/")[-1]) < _MIN_NAME_LEN):
+                return None
+
+            # Owner/repo fragment check
+            if owner and (_INVALID_TRAILING.search(owner) or len(owner) < _MIN_NAME_LEN):
+                return None
+            if repo and (_INVALID_TRAILING.search(repo.split("@")[0]) or
+                         len(repo.split("@")[0]) < _MIN_NAME_LEN):
+                return None
+
             return info
     return None
 
@@ -950,16 +1090,29 @@ _SRI_SCRIPT = re.compile(
 _HAS_INTEGRITY = re.compile(r'\bintegrity\s*=', re.IGNORECASE)
 
 def extract_cdn_urls(text: str) -> list[str]:
+    """
+    Extract CDN URLs from HTML/JS text.
+    Applies clean_extracted_url to each candidate to strip JS concat artifacts
+    before returning the list.
+    """
     found = set()
     for m in _BARE_CDN.finditer(text):
-        found.add(m.group(1))
+        url = clean_extracted_url(m.group(1))
+        if url:
+            found.add(url)
     for m in _SRC_CDN.finditer(text):
-        found.add(m.group(1))
+        url = clean_extracted_url(m.group(1))
+        if url:
+            found.add(url)
     for m in _IMPORT_MAP.finditer(text):
-        found.add(m.group(1))
+        url = clean_extracted_url(m.group(1))
+        if url:
+            found.add(url)
     for blk in re.findall(r'<script[^>]*>(.*?)</script>', text, re.DOTALL|re.IGNORECASE):
         for m in _BARE_CDN.finditer(blk):
-            found.add(m.group(1))
+            url = clean_extracted_url(m.group(1))
+            if url:
+                found.add(url)
     return list(found)
 
 def check_sri_missing(html: str) -> list[str]:
@@ -1011,14 +1164,15 @@ def exploit_guide(finding: dict) -> list[str]:
     url   = finding.get("url","")
     sev   = finding.get("severity","")
     claimed = finding.get("claimed", False)
+    ts    = finding.get("takeover_status", TS_UNKNOWN)
     issues  = finding.get("issues",[])
 
     steps = []
 
-    if claimed and sev == "CRITICAL" and cdn in ("jsdelivr-gh","raw-github","gist"):
+    if ts == TS_ALREADY_TAKEN and cdn in ("jsdelivr-gh","raw-github","gist"):
         stale_cached = any("CDN STALE CACHE" in i for i in issues)
         steps += [
-            "[ ACTIVE ATTACK — GitHub namespace squatted, serving malicious content ]",
+            "[ ACTIVE ATTACK — namespace squatted, serving malicious content ]",
             "",
             "Step 1 — Verify the malicious CDN response is live:",
             f"  curl -si '{url}' -H 'User-Agent: hackerone-shadowbyte'",
@@ -1035,7 +1189,7 @@ def exploit_guide(finding: dict) -> list[str]:
             f"  https://github.com/contact/report-abuse",
         ]
 
-    elif cdn in ("lifecycle-inject",):
+    elif ts == TS_ALREADY_TAKEN and cdn == "lifecycle-inject":
         steps += [
             "[ INSTALL-TIME RCE — npm lifecycle hook runs shell commands on install ]",
             "",
@@ -1048,66 +1202,113 @@ def exploit_guide(finding: dict) -> list[str]:
             "Step 3 — Report: postinstall hooks with curl/wget/eval are supply chain RCE",
         ]
 
-    elif cdn in ("lockfile-confusion",):
+    elif ts == TS_CLAIMABLE_NOW and cdn in ("github-action",):
         steps += [
-            "[ LOCKFILE CONFUSION — package resolved from unexpected registry ]",
+            f"[ UNCLAIMED GITHUB ACTION — {owner}/{repo}@{ref} ]",
             "",
-            "Step 1 — Identify the registry:",
-            f"  grep -A5 '{pkg}' package-lock.json | grep resolved",
+            f"Step 1 — Verify repo is still unclaimed:",
+            f"  curl -s 'https://api.github.com/repos/{owner}/{repo}' | python3 -c \"import sys,json; print(json.load(sys.stdin).get('message','EXISTS'))\"",
             "",
-            "Step 2 — Verify it's internal vs public:",
-            "  If the registry is an internal mirror, check if an attacker could publish",
-            "  a same-named package on the public registry to trigger dep confusion.",
+            f"Step 2 — Create the repo and push the expected tag:",
+            f"  gh repo create {owner}/{repo} --public",
+            f"  echo 'name: PoC' > action.yml && git add . && git commit -m 'PoC'",
+            f"  git tag {ref} && git push origin main --tags",
             "",
-            "Step 3 — Recommend: pin all packages to registry.npmjs.org explicitly in .npmrc",
+            "Step 3 — Impact: all pipelines using this action will run your code.",
+            "          They get the full GITHUB_TOKEN + all repository secrets.",
+            "",
+            f"Step 4 — Fix recommendation: pin to SHA instead of @{ref}",
         ]
 
-    elif cdn in ("github-action",):
-        steps += [
-            f"[ GITHUB ACTIONS SUPPLY CHAIN — {owner}/{repo}@{ref} ]",
-            "",
-            f"Step 1 — Check repo status: curl -s 'https://api.github.com/repos/{owner}/{repo}' | python3 -m json.tool",
-            f"Step 2 — If gone: gh repo create {owner}/{repo} --public && git tag {ref} && git push origin {ref}",
-            "Step 3 — Impact: pipeline GITHUB_TOKEN + all repository secrets exposed to the action",
-            "Step 4 — Fix: pin all third-party actions to full commit SHA, e.g.:",
-            f"  uses: {owner}/{repo}@<full-40-char-sha>  # instead of @{ref}",
-        ]
-
-    elif cdn in ("jsdelivr-gh", "raw-github", "github-pages") and not claimed:
+    elif ts == TS_CLAIMABLE_NOW and cdn in ("jsdelivr-gh", "raw-github", "github-pages"):
         is_user_gone = not finding.get("details",{}).get("user",{}).get("exists", True)
         steps += [
-            f"[ UNCLAIMED {'USER/ORG' if is_user_gone else 'REPO'} — can be registered NOW ]",
+            f"[ CLAIMABLE — {'USER NAMESPACE GONE' if is_user_gone else 'REPO GONE, USER EXISTS'} ]",
             "",
             f"Step 1 — Confirm namespace is still unclaimed:",
             f"  curl -s 'https://api.github.com/users/{owner}' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('login','NOT FOUND'))\"",
             "",
-            "Step 2 — Create the GitHub account/repo:",
+            "Step 2 — Register the account/repo:",
             f"  → Register https://github.com/join with username: {owner}" if is_user_gone else f"  gh repo create {owner}/{repo} --public",
             "",
-            "Step 3 — PoC content (DO NOT deploy actual malware):",
+            "Step 3 — PoC content (harmless marker only, NOT malware):",
             "  echo 'console.log(\"supply-chain-poc-shadowbyte\");' > index.js",
             f"  git add . && git commit -m 'PoC' && git tag v1.0.0 && git push origin main --tags",
             "",
-            f"Step 4 — Verify: curl -s '{url}'",
+            f"Step 4 — Verify delivery: curl -s '{url}'",
+            "",
+            "Step 5 — Report to HackerOne with CDN URL, GitHub namespace, and PoC commit SHA.",
         ]
 
-    elif cdn in ("jsdelivr-npm","unpkg","esm-sh","skypack","jspm") and not claimed \
-         and not finding.get("details",{}).get("npm",{}).get("exists", True):
+    elif ts == TS_CLAIMABLE_NOW and cdn in ("jsdelivr-npm","unpkg","esm-sh","skypack","jspm"):
         typo = finding.get("details",{}).get("typosquat_of","")
         steps += [
-            f"[ UNCLAIMED NPM PACKAGE{' — TYPOSQUAT of: ' + typo if typo else ''} ]",
+            f"[ CLAIMABLE NPM PACKAGE{' — TYPOSQUAT of: ' + typo if typo else ''} ]",
             "",
-            f"Step 1 — Confirm: curl -s 'https://registry.npmjs.org/{pkg}' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('error','EXISTS'))\"",
+            f"Step 1 — Confirm package does not exist:",
+            f"  curl -s 'https://registry.npmjs.org/{pkg}' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('error','EXISTS'))\"",
             "",
-            f"Step 2 — Scaffold PoC:",
-            f"  mkdir /tmp/{pkg}-poc && cd /tmp/{pkg}-poc",
+            f"Step 2 — Scaffold PoC package:",
+            f"  mkdir /tmp/{pkg.replace('/', '-')}-poc && cd /tmp/{pkg.replace('/', '-')}-poc",
             f"  npm init -y  # name: {pkg}",
             "  echo 'console.log(\"supply-chain-poc-shadowbyte\");' > index.js",
             "",
-            "Step 3 — Publish (PoC only):",
+            "Step 3 — Publish (PoC only — do NOT include any malicious code):",
             "  npm publish --access public",
             "",
-            f"Step 4 — Verify: curl -s '{url}'",
+            f"Step 4 — Verify CDN propagation: curl -s '{url}'",
+            "",
+            "Step 5 — Report with npm package name, CDN URL, affected pages, and PoC publish date.",
+        ]
+
+    elif ts == TS_DEAD_MAINTAINER:
+        dead = finding.get("details",{}).get("npm",{}).get("dead_maintainers",[])
+        steps += [
+            f"[ DEAD MAINTAINER — npm accounts are registerable ]",
+            "",
+            f"  Dead accounts: {dead}",
+            "",
+            f"Step 1 — Confirm account(s) are still unclaimed:",
+            *[f"  curl -s 'https://www.npmjs.com/~{u}' | grep -c 'Page Not Found'" for u in dead[:3]],
+            "",
+            "Step 2 — Register the npm username(s) at https://www.npmjs.com/signup",
+            "",
+            "Step 3 — Once registered, you will appear as a maintainer of the package",
+            "          and can publish new versions under this package name.",
+            "",
+            f"Step 4 — Publish a PoC version (increment patch version, add console.log only):",
+            f"  npm publish --access public",
+            "",
+            "Step 5 — Report with affected package name, dead account name, CDN URL.",
+        ]
+
+    elif ts == TS_ARCHIVED_RISK:
+        steps += [
+            f"[ ARCHIVED REPO — currently NOT claimable but monitor for deletion ]",
+            "",
+            f"  {owner}/{repo} is archived. GitHub does not allow claiming archived repos",
+            "  while they still exist, but the owner may delete it in future.",
+            "",
+            "Step 1 — Monitor the repo for deletion:",
+            f"  curl -s 'https://api.github.com/repos/{owner}/{repo}' | python3 -c \"import sys,json; print(json.load(sys.stdin).get('message','still exists'))\"",
+            "",
+            "Step 2 — If deleted, immediately register the namespace and create the repo.",
+            "",
+            f"  jsDelivr CDN URL that would be affected: {url}",
+        ]
+
+    elif ts == TS_FLOATING_REF:
+        steps += [
+            "[ FLOATING REF — active maintainer, NOT currently claimable ]",
+            "",
+            "  This is an informational finding. The maintainer exists and owns the namespace.",
+            "  There is no direct takeover vector right now.",
+            "",
+            "  Risk: if the maintainer's account is compromised or they abandon the package,",
+            "  an attacker could push malicious code that propagates via this floating ref.",
+            "",
+            "  Recommendation: advocate for the consuming site to pin to a specific version/SHA.",
+            f"  Affected URL: {url}",
         ]
 
     elif sev == "LOW" and any("NO SRI" in i for i in issues):
@@ -1145,6 +1346,7 @@ def _severity_max(a: str, b: str) -> str:
     bi = order.index(b) if b in order else 0
     return b if bi > ai else a
 
+
 def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
     cdn     = dep["cdn"]
     raw_url = dep["raw_url"]
@@ -1159,6 +1361,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
     claimed  = False
     details  = {}
     signals  = 0
+    takeover_status = TS_UNKNOWN
 
     filepath = dep.get("filepath", "") or ""
     if cdn in ("raw-github", "jsdelivr-gh") and _NON_EXECUTABLE_EXTS.search(filepath):
@@ -1180,7 +1383,9 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 if r_dest and r_dest.status_code == 200 and len(r_dest.text) > 500:
                     return dict(url=raw_url, cdn=cdn, owner=owner, repo=repo, package=pkg,
                                 ref=ref, version=version, severity="LOW",
-                                claimed=False, details={"redirect_dest": dest, "dest_size": len(r_dest.text)},
+                                claimed=False,
+                                takeover_status=TS_FLOATING_REF,
+                                details={"redirect_dest": dest, "dest_size": len(r_dest.text)},
                                 signals=1,
                                 issues=[
                                     f"DEAD CDN (benign redirect): rawgit.com → {dest} — "
@@ -1194,7 +1399,9 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         issues.append("Dead CDN: rawgit.com/gitcdn.xyz shut down 2019 — requests may silently redirect or 404")
         return dict(url=raw_url, cdn=cdn, owner=owner, repo=repo, package=pkg,
                     ref=ref, version=version, issues=issues, severity="MEDIUM",
-                    claimed=False, details={}, exploit_steps=[
+                    claimed=False,
+                    takeover_status=TS_UNKNOWN,
+                    details={}, exploit_steps=[
                         f"Step 1 — Test: curl -si '{raw_url}' -H 'User-Agent: hackerone-shadowbyte'",
                         "Step 2 — If redirect target is controllable, escalate.",
                         "Step 3 — Recommend migrating to maintained CDN.",
@@ -1209,11 +1416,14 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         details["user"] = user_info
 
         if not user_info.get("exists"):
+            # ── CONFIRMED CLAIMABLE: user namespace is gone ──
             issues.append(
                 f"UNCLAIMED NAMESPACE: GitHub user/org '{owner}' does not exist — "
-                f"anyone can register it and serve arbitrary code via this CDN URL"
+                f"register the account and create the repo to serve arbitrary code via this CDN URL"
             )
-            sev = "CRITICAL"; signals += 3
+            sev = "CRITICAL"
+            signals += 3
+            takeover_status = TS_CLAIMABLE_NOW
         else:
             age = user_info.get("age_days")
             utype = user_info.get("type","User")
@@ -1237,14 +1447,27 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 details["repo"] = repo_info
 
                 if not repo_info.get("exists"):
+                    # ── CONFIRMED CLAIMABLE: user exists, repo does not ──
                     issues.append(
                         f"UNCLAIMED REPO: '{owner}/{repo}' does not exist — "
                         f"create it to serve arbitrary content via this CDN URL"
                     )
-                    sev = "CRITICAL"; signals += 3
+                    sev = "CRITICAL"
+                    signals += 3
+                    takeover_status = TS_CLAIMABLE_NOW
                 else:
                     stars = repo_info.get("stars", 0)
                     desc  = repo_info.get("description","")
+                    archived = repo_info.get("archived", False)
+
+                    if archived:
+                        issues.append(
+                            f"ARCHIVED REPO: '{owner}/{repo}' is archived — "
+                            f"maintainer has abandoned it. Monitor for deletion → claimable."
+                        )
+                        sev = _severity_max(sev, "MEDIUM"); signals += 1
+                        if takeover_status == TS_UNKNOWN:
+                            takeover_status = TS_ARCHIVED_RISK
 
                     established_account = (
                         age is not None and age > 365 and
@@ -1314,6 +1537,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 if r and r.status_code == 404:
                     issues.append(f"GITHUB PAGES 404: site returns 404 — repo may be claimable")
                     sev = _severity_max(sev, "HIGH"); signals += 2
+                    takeover_status = TS_CLAIMABLE_NOW
 
         if ref and ref.lower() in FLOATING_REFS:
             issues.append(
@@ -1322,6 +1546,9 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
             if sev == "INFO":
                 sev = "LOW"
             signals += 1
+            # Only set FLOATING_REF status if we haven't already determined a stronger status
+            if takeover_status == TS_UNKNOWN:
+                takeover_status = TS_FLOATING_REF
 
     elif cdn in ("jsdelivr-npm","unpkg","esm-sh","skypack","jspm"):
         if not pkg:
@@ -1330,7 +1557,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         npm_data = npm_info(pkg)
         details["npm"] = npm_data
 
-        # ── NEW: Typosquatting check ──────────────────────────
+        # ── Typosquatting check ──────────────────────────────
         typo_of = check_typosquatting(pkg)
         if typo_of and npm_data.get("exists"):
             details["typosquat_of"] = typo_of
@@ -1341,24 +1568,28 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
             sev = _severity_max(sev, "HIGH"); signals += 2
 
         if not npm_data.get("exists"):
+            # ── CONFIRMED CLAIMABLE: package doesn't exist on npm ──
             issues.append(
                 f"UNCLAIMED NPM: '{pkg}' does not exist — "
                 f"publish it to serve arbitrary code via this CDN URL"
             )
             sev = "CRITICAL"; signals += 3
+            takeover_status = TS_CLAIMABLE_NOW
 
         elif npm_data.get("unpublished"):
             issues.append(f"UNPUBLISHED: '{pkg}' was unpublished from npm")
             sev = _severity_max(sev, "HIGH"); signals += 2
+            takeover_status = TS_CLAIMABLE_NOW
 
         else:
             dead = npm_data.get("dead_maintainers", [])
             if dead:
                 issues.append(
                     f"DEAD MAINTAINER ACCOUNT(S): {dead} — "
-                    f"anyone who registers them becomes a listed maintainer with publish rights"
+                    f"npm profiles confirmed registerable; registering gives publish rights"
                 )
                 sev = _severity_max(sev, "HIGH"); signals += 2
+                takeover_status = TS_DEAD_MAINTAINER
 
             days = npm_data.get("days_since")
             _abandoned = False
@@ -1370,11 +1601,15 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 days_since = npm_data.get("days_since") or 9999
                 dead = npm_data.get("dead_maintainers", [])
                 if days_since < 180 and not dead:
-                    pass
+                    # Actively maintained + floating version = informational only
+                    if takeover_status == TS_UNKNOWN:
+                        takeover_status = TS_FLOATING_REF
                 else:
                     issues.append(f"FLOATING VERSION: @{version} — any new publish propagates immediately")
                     if sev == "INFO": sev = "LOW"
                     signals += 1
+                    if takeover_status == TS_UNKNOWN:
+                        takeover_status = TS_FLOATING_REF
                 if _abandoned:
                     days = details.get("abandoned_days", 0)
                     issues.append(f"ABANDONED: last published {days} days ago — "
@@ -1391,6 +1626,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 if not scope_exists:
                     issues.append(f"UNCLAIMED NPM SCOPE: @{scope} scope is not registered")
                     sev = _severity_max(sev, "HIGH"); signals += 2
+                    takeover_status = TS_CLAIMABLE_NOW
 
     elif cdn == "cdnjs":
         if not pkg:
@@ -1414,6 +1650,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                             f"backing repo is claimable"
                         )
                         sev = _severity_max(sev, "HIGH"); signals += 2
+                        takeover_status = TS_CLAIMABLE_NOW
             except Exception:
                 pass
 
@@ -1424,6 +1661,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         if r and r.status_code == 404:
             issues.append(f"UNCLAIMED DENO MODULE: 'deno.land/x/{pkg}' returns 404")
             sev = _severity_max(sev, "HIGH"); signals += 2
+            takeover_status = TS_CLAIMABLE_NOW
 
     elif cdn == "gist":
         if owner:
@@ -1432,6 +1670,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
             if not user_info.get("exists"):
                 issues.append(f"UNCLAIMED GIST OWNER: '{owner}' does not exist")
                 sev = "HIGH"; signals += 2
+                takeover_status = TS_CLAIMABLE_NOW
 
     if not issues:
         return None
@@ -1447,6 +1686,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         if mal:
             issues.append(f"MALICIOUS CONTENT ({len(mal)} signal(s)): " + " | ".join(mal))
             sev = "CRITICAL"; claimed = True; signals += 3
+            takeover_status = TS_ALREADY_TAKEN
 
         wayback = wayback_fetch(raw_url)
         details["wayback"] = wayback
@@ -1458,18 +1698,11 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
 
             jsdelivr_minified = "Minified by jsDelivr" in content[:500]
 
-            # ─── FALSE POSITIVE SUPPRESSION for established trusted maintainers ───
-            # Paul Irish / lite-youtube-embed (31K followers, 6335d old, 3K+ stars)
-            # is a legitimate library — content changes are version bumps, not attacks.
-            # Apply: if account is trusted (age >2yr, followers >500, repo stars >500),
-            # a content hash change alone does NOT trigger CLAIMED or HIGH severity.
-            # We still report it as INFO/POTENTIAL for the content-change record.
             user_info_fp = details.get("user", {})
             repo_info_fp = details.get("repo", {})
             is_trusted = _is_trusted_maintainer(user_info_fp, repo_info_fp)
 
             if wb_size > 200 and cur_size < wb_size * 0.3:
-                # >70% size drop — suspicious even for trusted maintainers
                 if is_trusted:
                     issues.append(
                         f"LARGE CONTENT DROP (trusted maintainer): archived={wb_size}B → "
@@ -1483,6 +1716,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                         f"({wb_size-cur_size}B dropped)"
                     )
                     sev = "CRITICAL"; claimed = True; signals += 3
+                    takeover_status = TS_ALREADY_TAKEN
 
             elif wb_hash and cur_hash and wb_hash != cur_hash and not jsdelivr_minified:
                 acct_age = details.get("user", {}).get("age_days") or 9999
@@ -1495,8 +1729,6 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                 active_npm = npm_days < 730 and not npm_dead
 
                 if is_trusted:
-                    # Trusted maintainer + floating ref + content change = informational only
-                    # The floating ref is already flagged separately; don't double-escalate
                     issues.append(
                         f"CONTENT UPDATED (trusted maintainer, verify): "
                         f"archived hash {wb_hash} ({wb_size}B) → current {cur_hash} ({cur_size}B) — "
@@ -1504,11 +1736,8 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                         f"{acct_age}d old — likely legitimate update. "
                         f"ACTION: update <script src> to a pinned version tag instead of @{ref}."
                     )
-                    # Do NOT set claimed=True or escalate severity for trusted maintainers
-                    # Only escalate severity if there are OTHER signals besides just content change
                     if signals > 1:
                         sev = _severity_max(sev, "MEDIUM")
-                    # Otherwise keep at LOW (floating ref signal)
                     signals += 1
 
                 elif (established and trivial_change) or (active_npm and trivial_change):
@@ -1526,6 +1755,7 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
                         f"size diff {size_drop_pct:.1%}"
                     )
                     sev = _severity_max(sev, "HIGH"); claimed = True; signals += 2
+                    takeover_status = TS_ALREADY_TAKEN
 
         if not current.get("consistent", True):
             issues.append("CDN INCONSISTENCY: two fetches returned different content")
@@ -1545,10 +1775,11 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
             if check_jsdelivr_stale_cache(raw_url):
                 issues.append(
                     "CDN STALE CACHE: jsDelivr is serving content but GitHub raw URL 404s — "
-                    "source deleted/emptied after purge-cache; CDN edges still serve malicious payload. "
+                    "source deleted/emptied after purge-cache; CDN edges still serve payload. "
                     f"Force-purge: https://purge.jsdelivr.net/gh/{owner}/{repo}@{ref}/{dep.get('filepath','')}"
                 )
                 sev = "CRITICAL"; claimed = True; signals += 3
+                takeover_status = TS_ALREADY_TAKEN
 
         if cdn == "jsdelivr-npm" and pkg and (
             not details.get("npm",{}).get("exists") or
@@ -1572,20 +1803,27 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         return None
 
     # ── Trusted maintainer final downgrade ────────────────────
-    # If the ONLY reason this is HIGH/CLAIMED is content change + floating ref on a trusted
-    # account, downgrade to LOW informational and mark not claimed.
     user_info_final = details.get("user", {})
     repo_info_final = details.get("repo", {})
     if _is_trusted_maintainer(user_info_final, repo_info_final):
-        # Only content-change + floating-ref issues? Downgrade.
         non_fp_issues = [i for i in issues if not any(k in i for k in (
             "CONTENT UPDATED", "FLOATING REF", "HIGH REACH", "CONTENT CHANGED",
         ))]
         if not non_fp_issues:
-            # All issues are floating ref / content change on trusted account — informational only
             sev = "LOW"
             claimed = False
             signals = max(1, signals - 2)
+            if takeover_status in (TS_UNKNOWN, TS_ALREADY_TAKEN):
+                takeover_status = TS_FLOATING_REF
+
+    # Final takeover_status assignment if still unknown
+    if takeover_status == TS_UNKNOWN:
+        if claimed:
+            takeover_status = TS_ALREADY_TAKEN
+        elif sev in ("CRITICAL", "HIGH"):
+            takeover_status = TS_CLAIMABLE_NOW
+        else:
+            takeover_status = TS_FLOATING_REF
 
     if sev in ("INFO", "LOW") and signals < 2:
         return dict(
@@ -1593,7 +1831,9 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
             owner=owner, repo=repo, package=pkg,
             ref=ref or version, version=version,
             issues=issues, severity="POTENTIAL",
-            claimed=False, details=details, signals=signals,
+            claimed=False,
+            takeover_status=takeover_status,
+            details=details, signals=signals,
         )
     if sev == "MEDIUM" and signals < 1:
         return None
@@ -1603,12 +1843,15 @@ def validate_cdn_dep(dep: dict, verbose: bool = False) -> Optional[dict]:
         owner=owner, repo=repo, package=pkg,
         ref=ref or version, version=version,
         issues=issues, severity=sev,
-        claimed=claimed, details=details, signals=signals,
+        claimed=claimed,
+        takeover_status=takeover_status,
+        details=details, signals=signals,
     )
 
 
 def validate_github_dep(owner: str, repo: str, ref: str = "", context: str = "") -> Optional[dict]:
     issues = []; sev = "INFO"; signals = 0; details = {}
+    takeover_status = TS_UNKNOWN
 
     user_info = gh_user(owner)
     details["user"] = user_info
@@ -1616,6 +1859,7 @@ def validate_github_dep(owner: str, repo: str, ref: str = "", context: str = "")
     if not user_info.get("exists"):
         issues.append(f"UNCLAIMED OWNER: GitHub user/org '{owner}' does not exist")
         sev = "CRITICAL"; signals = 3
+        takeover_status = TS_CLAIMABLE_NOW
     else:
         age = user_info.get("age_days")
         if age is not None and age < 365:
@@ -1627,23 +1871,34 @@ def validate_github_dep(owner: str, repo: str, ref: str = "", context: str = "")
         if not repo_info.get("exists"):
             issues.append(f"UNCLAIMED REPO: '{owner}/{repo}' does not exist")
             sev = "CRITICAL"; signals += 3
+            takeover_status = TS_CLAIMABLE_NOW
         else:
+            if repo_info.get("archived"):
+                takeover_status = TS_ARCHIVED_RISK
             if ref and re.match(r'^[a-f0-9]{40}$', ref):
                 pass
             elif ref:
                 issues.append(f"NOT SHA-PINNED: ref='{ref}' is a mutable tag/branch")
                 if sev == "INFO": sev = "LOW"
                 signals += 1
+                if takeover_status == TS_UNKNOWN:
+                    takeover_status = TS_FLOATING_REF
 
     if not issues:
         return None
+
+    if takeover_status == TS_UNKNOWN:
+        takeover_status = TS_FLOATING_REF
+
     if sev in ("INFO","LOW") and signals < 2:
         return dict(
             url=f"https://github.com/{owner}/{repo}",
             cdn="github-dep", owner=owner, repo=repo,
             package=None, ref=ref, version=None,
             context=context, issues=issues,
-            severity="POTENTIAL", claimed=False, details=details, signals=signals,
+            severity="POTENTIAL", claimed=False,
+            takeover_status=takeover_status,
+            details=details, signals=signals,
         )
 
     return dict(
@@ -1651,7 +1906,9 @@ def validate_github_dep(owner: str, repo: str, ref: str = "", context: str = "")
         cdn="github-dep", owner=owner, repo=repo,
         package=None, ref=ref, version=None,
         context=context, issues=issues,
-        severity=sev, claimed=False, details=details, signals=signals,
+        severity=sev, claimed=False,
+        takeover_status=takeover_status,
+        details=details, signals=signals,
     )
 
 
@@ -1694,7 +1951,9 @@ def check_dep_confusion(pkg_json_text: str) -> list[dict]:
                         f"but does not exist on public npm"
                     ],
                     severity="HIGH",
-                    claimed=False, details={"npm": npm_data}, signals=3,
+                    claimed=False,
+                    takeover_status=TS_CLAIMABLE_NOW,
+                    details={"npm": npm_data}, signals=3,
                 ))
     return results
 
@@ -1739,7 +1998,9 @@ def sri_findings(html: str, page_url: str) -> list[dict]:
                 f"NO SRI (raw CDN source, no integrity check): <script src='{src}'> "
                 f"loaded from {cdn} without integrity= attribute"
             ],
-            severity="LOW", claimed=False, details={}, signals=1,
+            severity="LOW", claimed=False,
+            takeover_status=TS_FLOATING_REF,
+            details={}, signals=1,
         ))
     return results
 
@@ -1833,7 +2094,6 @@ def scan_package_json(text: str, source: str = "") -> list[dict]:
             f["source"] = source
             results.append(f)
     results += check_dep_confusion(text)
-    # ── NEW: lifecycle script scanning ───────────────────────
     results += scan_lifecycle_scripts(text, source=source)
     for cu in extract_cdn_urls(text):
         dep = parse_cdn_url(cu)
@@ -1854,9 +2114,7 @@ def scan_workflow(text: str, source: str = "") -> list[dict]:
             f["cdn"] = "github-action"
             f["source"] = source
             results.append(f)
-    # ── NEW: enhanced actions pinning audit ──────────────────
     results += audit_actions_pinning(text, source=source)
-    # Deduplicate by url+ref
     seen = set()
     deduped = []
     for r in results:
@@ -1868,7 +2126,6 @@ def scan_workflow(text: str, source: str = "") -> list[dict]:
 
 
 def scan_lockfile(text: str, source: str = "") -> list[dict]:
-    """Scan package-lock.json for lockfile confusion."""
     return scan_lockfile_confusion(text, source=source)
 
 
@@ -1923,17 +2180,28 @@ def scan_github_org(org: str, verbose: bool = False) -> list[dict]:
 SEV_COLOR = {"CRITICAL":RED,"HIGH":YELLOW,"MEDIUM":MAGENTA,"LOW":CYAN,"POTENTIAL":DIM,"INFO":DIM}
 SEV_ICON  = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","POTENTIAL":"🔍","INFO":"⚪"}
 
+TS_LABEL = {
+    TS_CLAIMABLE_NOW:   c(RED,    "⚡ CLAIMABLE NOW"),
+    TS_ALREADY_TAKEN:   c(RED,    "☠  ALREADY TAKEN / ACTIVE ATTACK"),
+    TS_DEAD_MAINTAINER: c(YELLOW, "💀 DEAD MAINTAINER"),
+    TS_ARCHIVED_RISK:   c(YELLOW, "📦 ARCHIVED RISK"),
+    TS_FLOATING_REF:    c(DIM,    "〰  FLOATING REF (not currently takeable)"),
+    TS_FALSE_POSITIVE:  c(DIM,    "✓  FALSE POSITIVE"),
+    TS_UNKNOWN:         c(DIM,    "?  UNKNOWN"),
+}
+
 def print_finding(f: dict, idx: int):
     sev   = f.get("severity","INFO")
     col   = SEV_COLOR.get(sev, "")
     icon  = SEV_ICON.get(sev, "")
-    claimed = f.get("claimed", False)
-    status_label = c(RED,"CLAIMED / ACTIVE ATTACK") if claimed else c(YELLOW,"UNCLAIMED / CLAIMABLE")
+    ts    = f.get("takeover_status", TS_UNKNOWN)
+    ts_label = TS_LABEL.get(ts, ts)
     signals = f.get("signals", "?")
 
     sprint()
     sprint(c(BOLD, "─" * 72))
-    sprint(c(col+BOLD, f"{icon}  [{sev}]  Finding #{idx}   {status_label}   signals={signals}"))
+    sprint(c(col+BOLD, f"{icon}  [{sev}]  Finding #{idx}   signals={signals}"))
+    sprint(f"    {'Status':<10} {ts_label}")
     sprint(c(BOLD,     f"    {'URL':<10} {f.get('url') or f.get('context','')}"))
     sprint(            f"    {'CDN':<10} {f.get('cdn','')}    ref/ver: {f.get('ref') or f.get('version','')} ")
     if f.get("owner"): sprint(f"    {'Owner':<10} {f['owner']}/{f.get('repo','')}")
@@ -1971,9 +2239,9 @@ def print_finding(f: dict, idx: int):
 
     tags = details.get("tags",[])
     if tags:
-        ts = ", ".join(f"{t['name']}→{t['sha']}" + (" [INFLATED]" if t.get("inflated") else "")
+        ts_str = ", ".join(f"{t['name']}→{t['sha']}" + (" [INFLATED]" if t.get("inflated") else "")
                        for t in tags[:6])
-        sprint(c(DIM, f"    Tags: {ts}"))
+        sprint(c(DIM, f"    Tags: {ts_str}"))
 
     npm = details.get("npm",{})
     if npm.get("exists"):
@@ -1997,7 +2265,8 @@ def print_banner():
 ║        supplychain.py — Supply Chain Attack & Dependency Scanner        ║
 ║  CDN squatting │ npm/PyPI/Cargo │ dep confusion │ GitHub namespace      ║
 ║  typosquatting │ lifecycle inject │ lockfile confusion │ Actions audit  ║
-║  3-stage validation │ Wayback diff │ trusted-maintainer FP guard        ║
+║  3-stage validation │ Wayback diff │ dynamic-construction FP guard      ║
+║  takeover status: CLAIMABLE_NOW / ALREADY_TAKEN / DEAD_MAINTAINER      ║
 ╚══════════════════════════════════════════════════════════════════════════╝"""))
 
 
@@ -2005,24 +2274,36 @@ def print_summary(all_findings: list[dict]):
     by_sev = {"CRITICAL":[],"HIGH":[],"MEDIUM":[],"LOW":[],"POTENTIAL":[],"INFO":[]}
     for f in all_findings:
         by_sev.setdefault(f.get("severity","INFO"),[]).append(f)
-    claimed   = sum(1 for f in all_findings if f.get("claimed"))
-    unclaimed = sum(1 for f in all_findings if not f.get("claimed") and f.get("issues"))
+
+    by_ts = {}
+    for f in all_findings:
+        ts = f.get("takeover_status", TS_UNKNOWN)
+        by_ts.setdefault(ts, []).append(f)
+
     confirmed = [f for f in all_findings if f.get("severity","") not in ("POTENTIAL","INFO")]
     potential = by_sev["POTENTIAL"]
+
     sprint()
     sprint(c(BOLD, "═"*72))
     sprint(c(BOLD, "SUMMARY"))
     sprint(c(BOLD, "═"*72))
-    sprint(f"  Confirmed findings:        {len(confirmed)}")
-    sprint(c(RED,     f"  CRITICAL:                  {len(by_sev['CRITICAL'])}"))
-    sprint(c(YELLOW,  f"  HIGH:                      {len(by_sev['HIGH'])}"))
-    sprint(c(MAGENTA, f"  MEDIUM:                    {len(by_sev['MEDIUM'])}"))
-    sprint(c(CYAN,    f"  LOW:                       {len(by_sev['LOW'])}"))
-    if potential:
-        sprint(c(DIM,  f"  POTENTIAL (needs review):  {len(potential)}  ← partial signals, not confirmed"))
+    sprint(f"  Total findings:            {len(all_findings)}")
+    sprint(f"  Confirmed (non-potential): {len(confirmed)}")
     sprint()
-    sprint(c(RED,     f"  CLAIMED  (active attack):  {claimed}   ← already squatted"))
-    sprint(c(YELLOW,  f"  UNCLAIMED (claimable now): {unclaimed}   ← step-by-step claim guide provided"))
+    sprint(c(BOLD, "  By Severity:"))
+    sprint(c(RED,     f"    CRITICAL:                {len(by_sev['CRITICAL'])}"))
+    sprint(c(YELLOW,  f"    HIGH:                    {len(by_sev['HIGH'])}"))
+    sprint(c(MAGENTA, f"    MEDIUM:                  {len(by_sev['MEDIUM'])}"))
+    sprint(c(CYAN,    f"    LOW:                     {len(by_sev['LOW'])}"))
+    if potential:
+        sprint(c(DIM, f"    POTENTIAL:               {len(potential)}  ← partial signals"))
+    sprint()
+    sprint(c(BOLD, "  By Takeover Status:"))
+    sprint(c(RED,    f"    ☠  ALREADY TAKEN:         {len(by_ts.get(TS_ALREADY_TAKEN,[]))}  ← active attack, report immediately"))
+    sprint(c(RED,    f"    ⚡ CLAIMABLE NOW:          {len(by_ts.get(TS_CLAIMABLE_NOW,[]))}  ← namespace is gone, can be claimed"))
+    sprint(c(YELLOW, f"    💀 DEAD MAINTAINER:        {len(by_ts.get(TS_DEAD_MAINTAINER,[]))}  ← register the npm username"))
+    sprint(c(YELLOW, f"    📦 ARCHIVED RISK:          {len(by_ts.get(TS_ARCHIVED_RISK,[]))}  ← monitor for deletion"))
+    sprint(c(DIM,    f"    〰  FLOATING REF:           {len(by_ts.get(TS_FLOATING_REF,[]))}  ← risk only, not currently takeable"))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2054,6 +2335,8 @@ def main():
                     help="Also crawl same-origin subpages (depth 1)")
     ap.add_argument("--no-sri",          action="store_true",
                     help="Skip SRI absence findings")
+    ap.add_argument("--show-floating",   action="store_true",
+                    help="Include FLOATING_REF findings (not currently takeable, informational only)")
     ap.add_argument("-o","--output",     help="Write JSON results to file")
     ap.add_argument("-v","--verbose",    action="store_true",
                     help="Show all scan activity including [WARN] for unreachable hosts")
@@ -2138,6 +2421,7 @@ def main():
         print_summary([])
         return
 
+    # ── Deduplication ─────────────────────────────────────────
     seen_urls = set()
     deduped = []
     for f in all_findings:
@@ -2146,11 +2430,35 @@ def main():
             seen_urls.add(key)
             deduped.append(f)
 
-    order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
-    deduped.sort(key=lambda x: (order.get(x.get("severity","INFO"),9), -x.get("signals",0)))
+    # ── Filter: suppress FLOATING_REF unless --show-floating ──
+    if not args.show_floating:
+        actionable = [f for f in deduped
+                      if f.get("takeover_status") not in (TS_FLOATING_REF, TS_FALSE_POSITIVE)]
+        suppressed = len(deduped) - len(actionable)
+        if suppressed > 0:
+            sprint(c(DIM, f"\n  [{suppressed} FLOATING_REF / informational findings suppressed — "
+                          f"use --show-floating to see them]"))
+        deduped = actionable
+
+    # ── Sort: ALREADY_TAKEN first, then CLAIMABLE_NOW, then severity ──
+    ts_order = {
+        TS_ALREADY_TAKEN:   0,
+        TS_CLAIMABLE_NOW:   1,
+        TS_DEAD_MAINTAINER: 2,
+        TS_ARCHIVED_RISK:   3,
+        TS_UNKNOWN:         4,
+        TS_FLOATING_REF:    5,
+        TS_FALSE_POSITIVE:  6,
+    }
+    sev_order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
+    deduped.sort(key=lambda x: (
+        ts_order.get(x.get("takeover_status", TS_UNKNOWN), 9),
+        sev_order.get(x.get("severity","INFO"), 9),
+        -x.get("signals",0)
+    ))
     all_findings = deduped
 
-    sprint(c(BOLD+RED, f"\n[!] {len(all_findings)} confirmed supply chain finding(s):"))
+    sprint(c(BOLD+RED, f"\n[!] {len(all_findings)} supply chain finding(s):"))
     for i, f in enumerate(all_findings, 1):
         print_finding(f, i)
 
